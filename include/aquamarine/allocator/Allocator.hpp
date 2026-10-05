@@ -17,6 +17,10 @@ namespace Aquamarine {
     enum eAllocatorType {
         AQ_ALLOCATOR_TYPE_GBM = 0,
         AQ_ALLOCATOR_TYPE_DRM_DUMB,
+        AQ_ALLOCATOR_TYPE_SHM,
+        // Android exposes DMA-BUF heaps without a DRM render node. Keep this
+        // value last so the ABI values used by existing allocators stay put.
+        AQ_ALLOCATOR_TYPE_DMA_HEAP,
     };
 
     class IAllocator {

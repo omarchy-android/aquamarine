@@ -42,6 +42,7 @@ namespace Aquamarine {
     class IBuffer {
       public:
         virtual ~IBuffer() {
+            clearPresentationDMABUF();
             attachments.clear();
         };
 
@@ -62,6 +63,16 @@ namespace Aquamarine {
         void                                           backendUnpin();
         uint32_t                                       backendPinCount() const;
 
+        // A renderer may own a GPU-native image even when the backend's
+        // compatibility allocator supplied SHM. Keep a duplicated set of
+        // DMA-BUF descriptors here so a nested Wayland backend can present
+        // that image directly without changing swapchain ownership.
+        bool                                           setPresentationDMABUF(const SDMABUFAttrs& attrs);
+        SDMABUFAttrs                                   presentationDMABUF() const;
+        void                                           clearPresentationDMABUF();
+        void                                           setPresentationDMABUFActive(bool active);
+        bool                                           presentationDMABUFActive() const;
+
         Hyprutils::Math::Vector2D                      size;
         bool                                           opaque          = false;
         bool                                           lockedByBackend = false;
@@ -74,8 +85,10 @@ namespace Aquamarine {
         } events;
 
       private:
-        int      locks       = 0;
-        uint32_t backendPins = 0;
+        int         locks                    = 0;
+        uint32_t    backendPins              = 0;
+        SDMABUFAttrs presentationDMABUFAttrs;
+        bool        presentationDMABUFIsActive = false;
     };
 
 };

@@ -51,8 +51,11 @@ bool Aquamarine::CSwapchain::reconfigure(const SSwapchainOptions& options_) {
         return false;
 
     options = options_;
-    if (options.format == DRM_FORMAT_INVALID)
-        options.format = buffers.at(0)->dmabuf().format;
+    if (options.format == DRM_FORMAT_INVALID) {
+        const auto dma = buffers.at(0)->dmabuf();
+        const auto shm = buffers.at(0)->shm();
+        options.format = dma.success ? dma.format : shm.format;
+    }
 
     allocator->getBackend()->log(AQ_LOG_DEBUG,
                                  std::format("Swapchain: Reconfigured a swapchain to {} {} of length {}", options.size, fourccToName(options.format), options.length));
@@ -63,12 +66,31 @@ SP<IBuffer> Aquamarine::CSwapchain::next(int* age) {
     if (!allocator || options.length <= 0)
         return nullptr;
 
-    lastAcquired = (lastAcquired + 1) % options.length;
+    // A nested Wayland compositor owns a submitted wl_buffer until it sends
+    // wl_buffer.release. Reusing such a buffer for a new render pass races the
+    // parent compositor and presents stale or partially-updated pixels. This
+    // matters especially for SHM, where the renderer writes directly into the
+    // memory Weston is still reading.
+    //
+    // Backends mark their in-flight buffers with IBuffer::lock(). Walk the
+    // whole ring and acquire only a buffer that the backend has released.
+    // Returning nullptr when the ring is exhausted lets the pending frame
+    // callback wake the renderer once the parent has consumed a buffer.
+    for (size_t i = 0; i < options.length; ++i) {
+        const auto candidate = (lastAcquired + 1 + i) % options.length;
+        if (buffers.at(candidate)->locked())
+            continue;
 
-    if (age)
-        *age = options.length; // we always just rotate
+        lastAcquired = candidate;
 
-    return buffers.at(lastAcquired);
+        if (age)
+            *age = options.length; // we always just rotate
+
+        return buffers.at(lastAcquired);
+    }
+
+    allocator->getBackend()->log(AQ_LOG_TRACE, "Swapchain: all buffers are still owned by the backend");
+    return nullptr;
 }
 
 bool Aquamarine::CSwapchain::fullReconfigure(const SSwapchainOptions& options_) {
@@ -83,9 +105,14 @@ bool Aquamarine::CSwapchain::fullReconfigure(const SSwapchainOptions& options_) 
             allocator->getBackend()->log(AQ_LOG_ERROR, "Swapchain: Failed acquiring a buffer");
             return false;
         }
-        allocator->getBackend()->log(AQ_LOG_TRACE,
-                                     std::format("Swapchain: Acquired a buffer with format {} and modifier 0x{:x} : {}", fourccToName(buf->dmabuf().format), buf->dmabuf().modifier,
-                                                 drmModifierToName(buf->dmabuf().modifier)));
+        const auto dma = buf->dmabuf();
+        const auto shm = buf->shm();
+        if (dma.success)
+            allocator->getBackend()->log(AQ_LOG_TRACE,
+                                         std::format("Swapchain: Acquired a buffer with format {} and modifier 0x{:x} : {}", fourccToName(dma.format), dma.modifier,
+                                                     drmModifierToName(dma.modifier)));
+        else
+            allocator->getBackend()->log(AQ_LOG_TRACE, std::format("Swapchain: Acquired a SHM buffer with format {}", fourccToName(shm.format)));
         bfs.emplace_back(buf);
     }
 

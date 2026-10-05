@@ -25,6 +25,7 @@ namespace Aquamarine {
         CWaylandBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend_);
         ~CWaylandBuffer();
         bool good();
+        bool usesPresentationDMABUF() const;
 
         bool pendingRelease = false;
 
@@ -35,6 +36,7 @@ namespace Aquamarine {
 
         Hyprutils::Memory::CWeakPointer<IBuffer>         buffer;
         Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend;
+        bool                                             presentationDMABUF = false;
 
         friend class CWaylandOutput;
     };
@@ -146,6 +148,8 @@ namespace Aquamarine {
         virtual Hyprutils::Memory::CSharedPointer<IAllocator>              preferredAllocator();
         virtual std::vector<Hyprutils::Memory::CSharedPointer<IAllocator>> getAllocators();
         virtual Hyprutils::Memory::CWeakPointer<IBackendImplementation>    getPrimary();
+        bool                                                               supportsLinearDmabuf() const;
+        bool                                                               supportsDmabuf(uint32_t format, uint64_t modifier) const;
 
         Hyprutils::Memory::CWeakPointer<CWaylandBackend>                   self;
         virtual int                                                        drmRenderNodeFD();

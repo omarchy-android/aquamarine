@@ -5,9 +5,11 @@
 #include "Shared.hpp"
 #include "FormatUtils.hpp"
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <xf86drm.h>
 #include <gbm.h>
+#include <GL/gl.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -16,6 +18,19 @@ using namespace Aquamarine;
 using namespace Hyprutils::Memory;
 using namespace Hyprutils::Math;
 #define SP CSharedPointer
+
+static uint32_t nestedRefreshRate() {
+    const auto value = getenv("AQ_WAYLAND_REFRESH_MHZ");
+    if (!value)
+        return 60000;
+
+    char* end = nullptr;
+    errno     = 0;
+    const auto parsed = std::strtoul(value, &end, 10);
+    if (errno || end == value || *end != '\0' || parsed < 30000 || parsed > 240000)
+        return 60000;
+    return parsed;
+}
 
 static std::pair<int, std::string> openExclusiveShm() {
     // Only absolute paths can be shared across different shm_open() calls
@@ -374,6 +389,32 @@ void Aquamarine::CWaylandBackend::initShell() {
 }
 
 bool Aquamarine::CWaylandBackend::initDmabuf() {
+    // linux-dmabuf v3 predates feedback objects but still advertises formats
+    // and modifiers directly on the global. Weston-on-Termux:X11 exposes v3.
+    if (waylandState.dmabuf->version() < 4) {
+        auto addFormat = [this](uint32_t format, uint64_t modifier) {
+            auto it = std::ranges::find_if(dmabufFormats, [format](const auto& candidate) { return candidate.drmFormat == format; });
+            if (it == dmabufFormats.end()) {
+                dmabufFormats.emplace_back(SDRMFormat{.drmFormat = format, .modifiers = {modifier}});
+                return;
+            }
+            if (std::ranges::find(it->modifiers, modifier) == it->modifiers.end())
+                it->modifiers.emplace_back(modifier);
+        };
+
+        waylandState.dmabuf->setFormat([this, addFormat](CCZwpLinuxDmabufV1* r, uint32_t format) {
+            addFormat(format, DRM_FORMAT_MOD_INVALID);
+        });
+        waylandState.dmabuf->setModifier(
+            [this, addFormat](CCZwpLinuxDmabufV1* r, uint32_t format, uint32_t modifierHi, uint32_t modifierLo) {
+                addFormat(format, (static_cast<uint64_t>(modifierHi) << 32U) | modifierLo);
+            });
+
+        wl_display_roundtrip(waylandState.display);
+        backend->log(AQ_LOG_DEBUG, std::format("zwp_linux_dmabuf_v1: legacy v{} advertised {} formats", waylandState.dmabuf->version(), dmabufFormats.size()));
+        return !dmabufFormats.empty();
+    }
+
     waylandState.dmabufFeedback = makeShared<CCZwpLinuxDmabufFeedbackV1>(waylandState.dmabuf->sendGetDefaultFeedback());
     if (!waylandState.dmabufFeedback) {
         backend->log(AQ_LOG_ERROR, "initDmabuf: failed to get default feedback");
@@ -475,11 +516,43 @@ bool Aquamarine::CWaylandBackend::initDmabuf() {
 }
 
 std::vector<SDRMFormat> Aquamarine::CWaylandBackend::getRenderFormats() {
-    return dmabufFormats;
+    if (!dmabufFormats.empty() && backend->primaryAllocator &&
+        backend->primaryAllocator->type() == AQ_ALLOCATOR_TYPE_DMA_HEAP) {
+        std::vector<SDRMFormat> linearFormats;
+        for (const auto& format : dmabufFormats) {
+            if (format.drmFormat != DRM_FORMAT_XRGB8888 && format.drmFormat != DRM_FORMAT_ARGB8888)
+                continue;
+            if (std::ranges::find(format.modifiers, DRM_FORMAT_MOD_LINEAR) != format.modifiers.end())
+                linearFormats.emplace_back(SDRMFormat{.drmFormat = format.drmFormat, .modifiers = {DRM_FORMAT_MOD_LINEAR}});
+        }
+        return linearFormats;
+    }
+    if (!dmabufFormats.empty() && backend->primaryAllocator && backend->primaryAllocator->type() != AQ_ALLOCATOR_TYPE_SHM)
+        return dmabufFormats;
+    return {SDRMFormat{.drmFormat = DRM_FORMAT_XRGB8888, .modifiers = {DRM_FORMAT_INVALID}},
+            SDRMFormat{.drmFormat = DRM_FORMAT_ARGB8888, .modifiers = {DRM_FORMAT_INVALID}}};
+}
+
+bool Aquamarine::CWaylandBackend::supportsLinearDmabuf() const {
+    if (!waylandState.dmabuf || waylandState.dmabufFailed)
+        return false;
+
+    return std::ranges::any_of(dmabufFormats, [](const auto& format) {
+        if (format.drmFormat != DRM_FORMAT_XRGB8888 && format.drmFormat != DRM_FORMAT_ARGB8888)
+            return false;
+        return std::ranges::find(format.modifiers, DRM_FORMAT_MOD_LINEAR) != format.modifiers.end();
+    });
+}
+
+bool Aquamarine::CWaylandBackend::supportsDmabuf(uint32_t format, uint64_t modifier) const {
+    const auto found = std::ranges::find_if(dmabufFormats, [format](const auto& candidate) { return candidate.drmFormat == format; });
+    if (found == dmabufFormats.end())
+        return false;
+    return std::ranges::find(found->modifiers, modifier) != found->modifiers.end();
 }
 
 std::vector<SDRMFormat> Aquamarine::CWaylandBackend::getCursorFormats() {
-    return dmabufFormats;
+    return getRenderFormats();
 }
 
 SP<IAllocator> Aquamarine::CWaylandBackend::preferredAllocator() {
@@ -496,6 +569,10 @@ Hyprutils::Memory::CWeakPointer<IBackendImplementation> Aquamarine::CWaylandBack
 
 Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend_) : backend(backend_) {
     name = name_;
+
+    // xdg-shell does not advertise output modes. Publish the Android target
+    // cadence explicitly so the nested compositor does not assume 60 Hz.
+    modes.emplace_back(SP<SOutputMode>(new SOutputMode(Vector2D{1280, 720}, nestedRefreshRate(), true)));
 
     // The scheduler's frameReady signal drives the public events.frame on this output.
     frameReadyListener = sched.frameReady.listen([this]() { events.frame.emit(); });
@@ -698,10 +775,22 @@ bool Aquamarine::CWaylandOutput::commit() {
         return false;
     }
 
-    if (wlBuffer->pendingRelease)
-        backend->backend->log(AQ_LOG_WARNING, std::format("Output {}: pending state has a non-released buffer??", name));
+    if (wlBuffer->pendingRelease) {
+        backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: refusing to reuse a non-released buffer", name));
+        needsFrame = true;
+        return false;
+    }
 
     wlBuffer->pendingRelease = true;
+    state->internalState.buffer->lock();
+    state->internalState.buffer->lockedByBackend = true;
+
+    // KGSL does not publish DRM implicit-sync fences for a DMA heap import in
+    // every driver path. This diagnostic/compatibility switch establishes the
+    // synchronization boundary before the parent compositor samples it. Once
+    // validated, this can be replaced by a native fence hand-off.
+    if (state->internalState.buffer->type() == BUFFER_TYPE_DMABUF && envEnabled("AQ_ANDROID_DMABUF_GLFINISH"))
+        glFinish();
 
     waylandState.surface->sendAttach(wlBuffer->waylandState.buffer.get(), 0, 0);
     waylandState.surface->sendDamageBuffer(0, 0, INT32_MAX, INT32_MAX);
@@ -744,9 +833,18 @@ SP<IBackendImplementation> Aquamarine::CWaylandOutput::getBackend() {
 SP<CWaylandBuffer> Aquamarine::CWaylandOutput::wlBufferFromBuffer(SP<IBuffer> buffer) {
     std::erase_if(backendState.buffers, [this](const auto& el) { return el.first.expired() || !swapchain->contains(el.first.lock()); });
 
-    for (auto const& [k, v] : backendState.buffers) {
+    for (auto it = backendState.buffers.begin(); it != backendState.buffers.end(); ++it) {
+        const auto& [k, v] = *it;
         if (k != buffer)
             continue;
+
+        const auto presentation = buffer->presentationDMABUF();
+        const bool wantsPresentation = presentation.success && backend->waylandState.dmabuf &&
+            backend->supportsDmabuf(presentation.format, presentation.modifier);
+        if (wantsPresentation != v->usesPresentationDMABUF() && !v->pendingRelease) {
+            backendState.buffers.erase(it);
+            break;
+        }
 
         return v;
     }
@@ -896,6 +994,64 @@ void Aquamarine::CWaylandOutput::scheduleFrame(const scheduleFrameReason reason)
 }
 
 Aquamarine::CWaylandBuffer::CWaylandBuffer(SP<IBuffer> buffer_, Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend_) : buffer(buffer_), backend(backend_) {
+    // A renderer may have provided a DMA-BUF view of a buffer the backend
+    // itself cannot export (e.g. an SHM-backed buffer). If so, present that.
+    const auto presentation = buffer->presentationDMABUF();
+    if (presentation.success && backend->waylandState.dmabuf && backend->supportsDmabuf(presentation.format, presentation.modifier)) {
+        auto params = makeShared<CCZwpLinuxBufferParamsV1>(backend->waylandState.dmabuf->sendCreateParams());
+        if (params) {
+            for (int i = 0; i < presentation.planes; ++i)
+                params->sendAdd(presentation.fds.at(i), i, presentation.offsets.at(i), presentation.strides.at(i), presentation.modifier >> 32,
+                                presentation.modifier & 0xFFFFFFFF);
+
+            waylandState.buffer = makeShared<CCWlBuffer>(
+                params->sendCreateImmed(presentation.size.x, presentation.size.y, presentation.format, (zwpLinuxBufferParamsV1Flags)0));
+            params->sendDestroy();
+
+            if (waylandState.buffer) {
+                presentationDMABUF = true;
+                buffer->setPresentationDMABUFActive(true);
+                backend->backend->log(AQ_LOG_DEBUG, std::format("WaylandBuffer: presenting GPU DMA-BUF format 0x{:08x}, modifier 0x{:016x}",
+                                                                presentation.format, presentation.modifier));
+                waylandState.buffer->setRelease([this](CCWlBuffer* r) {
+                    pendingRelease = false;
+                    if (const auto aqBuffer = buffer.lock(); aqBuffer && aqBuffer->lockedByBackend) {
+                        aqBuffer->lockedByBackend = false;
+                        aqBuffer->unlock();
+                    }
+                });
+                return;
+            }
+        }
+        backend->backend->log(AQ_LOG_WARNING, "WaylandBuffer: GPU presentation override failed, falling back to SHM");
+    }
+
+    // SHM path: when the buffer carries SHM attrs (e.g. our CSHMAllocator),
+    // import the memfd via wl_shm_pool instead of linux-dmabuf.
+    const auto shm = buffer->shm();
+    if (shm.success) {
+        const int poolSize = shm.offset + static_cast<int64_t>(shm.stride) * static_cast<int64_t>(shm.size.y);
+        auto      pool     = makeShared<CCWlShmPool>(backend->waylandState.shm->sendCreatePool(shm.fd, poolSize));
+        if (!pool) {
+            backend->backend->log(AQ_LOG_ERROR, "WaylandBuffer: failed to create SHM pool");
+            return;
+        }
+
+        waylandState.buffer = makeShared<CCWlBuffer>(
+            pool->sendCreateBuffer(shm.offset, shm.size.x, shm.size.y, shm.stride, shmFormatFromDRM(shm.format)));
+        pool.reset();
+
+        if (waylandState.buffer)
+            waylandState.buffer->setRelease([this](CCWlBuffer* r) {
+                pendingRelease = false;
+                if (const auto aqBuffer = buffer.lock(); aqBuffer && aqBuffer->lockedByBackend) {
+                    aqBuffer->lockedByBackend = false;
+                    aqBuffer->unlock();
+                }
+            });
+        return;
+    }
+
     auto params = makeShared<CCZwpLinuxBufferParamsV1>(backend->waylandState.dmabuf->sendCreateParams());
 
     if (!params) {
@@ -911,16 +1067,30 @@ Aquamarine::CWaylandBuffer::CWaylandBuffer(SP<IBuffer> buffer_, Hyprutils::Memor
 
     waylandState.buffer = makeShared<CCWlBuffer>(params->sendCreateImmed(attrs.size.x, attrs.size.y, attrs.format, (zwpLinuxBufferParamsV1Flags)0));
 
-    waylandState.buffer->setRelease([this](CCWlBuffer* r) { pendingRelease = false; });
+    waylandState.buffer->setRelease([this](CCWlBuffer* r) {
+        pendingRelease = false;
+        if (const auto aqBuffer = buffer.lock(); aqBuffer && aqBuffer->lockedByBackend) {
+            aqBuffer->lockedByBackend = false;
+            aqBuffer->unlock();
+        }
+    });
 
     params->sendDestroy();
 }
 
 Aquamarine::CWaylandBuffer::~CWaylandBuffer() {
+    if (presentationDMABUF) {
+        if (const auto aqBuffer = buffer.lock())
+            aqBuffer->setPresentationDMABUFActive(false);
+    }
     if (waylandState.buffer && waylandState.buffer->resource())
         waylandState.buffer->sendDestroy();
 }
 
 bool Aquamarine::CWaylandBuffer::good() {
     return waylandState.buffer && waylandState.buffer->resource();
+}
+
+bool Aquamarine::CWaylandBuffer::usesPresentationDMABUF() const {
+    return presentationDMABUF;
 }

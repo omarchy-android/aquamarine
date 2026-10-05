@@ -4,6 +4,8 @@
 #include <aquamarine/backend/DRM.hpp>
 #include <aquamarine/backend/Null.hpp>
 #include <aquamarine/allocator/GBM.hpp>
+#include <aquamarine/allocator/DMAHeap.hpp>
+#include <aquamarine/allocator/SHM.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
 #include <ranges>
 #include <sys/timerfd.h>
@@ -171,6 +173,16 @@ bool Aquamarine::CBackend::start() {
             primaryAllocator = CGBMAllocator::create(fd, self);
             break;
         }
+    }
+
+    // Android fallback: when no backend exposes a DRM render node (the nested
+    // Wayland compositor on Termux:X11 only speaks linux-dmabuf v3), prefer a
+    // DMA heap allocation from /dev/dma_heap/system. SHM is the last resort
+    // when even DMAHeap isn't available.
+    if (!primaryAllocator && (implementations.empty() || implementations.at(0)->type() != AQ_BACKEND_NULL)) {
+        primaryAllocator = CDMAHeapAllocator::create(self);
+        if (!primaryAllocator)
+            primaryAllocator = CSHMAllocator::create(self);
     }
 
     if (!primaryAllocator && (implementations.empty() || implementations.at(0)->type() != AQ_BACKEND_NULL)) {
